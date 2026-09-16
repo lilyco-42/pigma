@@ -23,6 +23,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::Rect,
     style::Style,
+    text::Line,
     widgets::{Block, Paragraph, Wrap},
     Terminal,
 };
@@ -90,14 +91,21 @@ fn load_cmds(path: &PathBuf) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    // 与歌词行一一对应 (非 tool 事件留空), 这样 cmds[当前行] 就是可执行命令
+    // ⚠️ 必须与 load_lines() 的过滤规则完全一致 (跳过空行 + 解析失败行),
+    // 否则索引会错位 —— cmds[cur] 命中空条目 → "r 键没反应"(实测踩坑)。
     raw.lines()
-        .map(|l| {
+        .filter_map(|l| {
             let l = l.trim();
-            match serde_json::from_str::<serde_json::Value>(l) {
-                Ok(v) if v["kind"] == "tool" => v["arg"].as_str().unwrap_or("").to_string(),
-                _ => String::new(),
+            if l.is_empty() {
+                return None;
             }
+            serde_json::from_str::<serde_json::Value>(l).ok().map(|v| {
+                if v["kind"] == "tool" {
+                    v["arg"].as_str().unwrap_or("").to_string()
+                } else {
+                    String::new()
+                }
+            })
         })
         .collect()
 }
@@ -130,6 +138,78 @@ fn run_cmd(cmd: &str) -> String {
     }
 }
 
+/// 扫描目录 (类 yazi 面板): 跳过隐藏/target/node_modules, 深度 ≤3, 最多 200 条
+fn scan_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(d: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+        if depth > 3 || out.len() >= 200 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        let mut entries: Vec<std::path::PathBuf> =
+            rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, depth + 1, out);
+            } else {
+                out.push(p);
+            }
+            if out.len() >= 200 {
+                break;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0, &mut out);
+    out
+}
+
+/// 预览文件: 行号 + 轻量语法着色 (按扩展名; 真 LSP 语义高亮见 P2)
+fn preview_file(p: &std::path::Path) -> Vec<Line<'static>> {
+    use ratatui::style::Color;
+    use ratatui::text::Span;
+    let Ok(raw) = std::fs::read_to_string(p) else {
+        return vec![Line::from("(无法读取: 非文本或权限不足)")];
+    };
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let code = matches!(ext, "rs" | "py" | "js" | "ts" | "go" | "c" | "cpp" | "java");
+    raw.lines()
+        .take(500)
+        .enumerate()
+        .map(|(i, l)| {
+            let t = l.trim_start();
+            let fg = if !code {
+                Color::Rgb(180, 180, 180)
+            } else if t.starts_with('#') || t.starts_with("//") {
+                Color::Rgb(110, 110, 110) // 注释
+            } else if t.starts_with('"') || t.starts_with('\'') {
+                Color::Rgb(150, 190, 140) // 字符串
+            } else if t.starts_with("fn ")
+                || t.starts_with("def ")
+                || t.starts_with("class ")
+                || t.starts_with("pub ")
+                || t.starts_with("use ")
+                || t.starts_with("import ")
+            {
+                Color::Rgb(130, 170, 220) // 关键字
+            } else {
+                Color::Rgb(195, 195, 195)
+            };
+            Line::from(vec![
+                Span::styled(format!("{:>4} ", i + 1), Style::default().fg(Color::Rgb(90, 90, 90))),
+                Span::styled(l.to_string(), Style::default().fg(fg)),
+            ])
+        })
+        .collect()
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -137,7 +217,9 @@ fn main() -> io::Result<()> {
             "用法: pigma-trace <trace.ndjson> [--follow] [--speed 1.0] [--beat 1200] [--real]\n\
              \x20 --beat <ms>  一步一拍 (默认 1200ms, 覆盖事件时间轴 —— 快任务不会一闪而过)\n\
              \x20 --real       用 trace 里的真实 t_ms (适合本身就跨秒的任务)\n\
-             键位: 空格 暂停/播放 · j/k 单步 · +/- 调速 · r 真执行当前步(看结果) · R 清空 · q 退出"
+             键位: 空格 暂停/播放 · j/k 单步 · +/- 调速 · r 真执行当前步(看结果) · R 清空\n\
+             \x20     f 文件面板(yazi-like) · n/p 选文件 · o 预览(带语法着色) · q 退出\n\
+             \x20     文件面板根目录可用 LYCO_TRACE_ROOT 指定 (默认当前目录)"
         );
         std::process::exit(2);
     }
@@ -173,6 +255,10 @@ fn main() -> io::Result<()> {
     }
     // `r` 键真执行当前步的输出 (结果面板)
     let mut result: Option<String> = None;
+    // `f` 键: 类 yazi 的文件面板 (看生成了什么文件) + `o` 预览
+    let mut files: Option<Vec<std::path::PathBuf>> = None;
+    let mut file_cur: usize = 0;
+    let mut viewing: Option<std::path::PathBuf> = None;
 
     // 终端: raw + 备用屏
     enable_raw_mode()?;
@@ -228,10 +314,44 @@ fn main() -> io::Result<()> {
             .unwrap_or(0);
 
         let show = result.clone();
+        let show_files = files.clone();
+        let show_view = viewing.clone();
         if let Err(e) = terminal.draw(|f| {
             let area: Rect = f.area();
-            // 结果面板: 有输出时占下方 40%, 歌词在上
-            let (ly_area, res_area) = if show.is_some() && area.height > 8 {
+            // 底部面板: 预览 > 文件列表 > 执行结果
+            let mut bottom: Option<Vec<Line<'static>>> = None;
+            let mut title = String::new();
+            if let Some(p) = &show_view {
+                let mut v = preview_file(p);
+                v.insert(0, Line::from(format!("── {} ──", p.display())));
+                title = " 预览 (f 关面板, n/p 换文件) ".to_string();
+                bottom = Some(v);
+            } else if let Some(list) = &show_files {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let mut v = vec![Line::from(format!(
+                    "── {} 个文件 · n/p 选择 · o 预览 · f 关闭 ──",
+                    list.len()
+                ))];
+                for (i, p) in list.iter().enumerate() {
+                    let rel = p.strip_prefix(&cwd).unwrap_or(p);
+                    v.push(Line::from(format!(
+                        "{} {}",
+                        if i == file_cur { "\u{25B6}" } else { " " },
+                        rel.display()
+                    )));
+                }
+                title = " 文件面板 (yazi-like) ".to_string();
+                bottom = Some(v);
+            } else if let Some(out) = &show {
+                bottom = Some(
+                    out.lines()
+                        .map(|l| Line::from(l.to_string()))
+                        .collect::<Vec<_>>(),
+                );
+                title = " \u{25B6} 执行结果 (r 重跑, R 清空) ".to_string();
+            }
+
+            let (ly_area, res_area) = if bottom.is_some() && area.height > 8 {
                 let h = area.height * 60 / 100;
                 (
                     Rect { height: h, ..area },
@@ -252,12 +372,12 @@ fn main() -> io::Result<()> {
                 "\u{25B6} AGENT TRACE",
                 ly_area,
             );
-            if let Some(ref out) = show {
+            if let Some(lines) = bottom {
                 if res_area.height > 0 {
-                    let p = Paragraph::new(out.as_str())
+                    let p = Paragraph::new(lines)
                         .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(ratatui::style::Color::Rgb(170, 170, 170)))
-                        .block(Block::default().title(" \u{25B6} 执行结果 (r 重跑, R 清空) "));
+                        .style(Style::default().fg(ratatui::style::Color::Rgb(175, 175, 175)))
+                        .block(Block::default().title(title));
                     f.render_widget(p, res_area);
                 }
             }
@@ -288,6 +408,40 @@ fn main() -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('R') => result = None,
+                    // f: 类 yazi 文件面板 (默认扫当前目录; 可用 LYCO_TRACE_ROOT 指定)
+                    KeyCode::Char('f') => {
+                        if files.is_some() {
+                            files = None;
+                            viewing = None;
+                        } else {
+                            let root = std::env::var("LYCO_TRACE_ROOT")
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+                            let list = scan_files(&root);
+                            file_cur = 0;
+                            viewing = None;
+                            files = Some(list);
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        if let Some(ref f) = files {
+                            if !f.is_empty() {
+                                file_cur = (file_cur + 1).min(f.len() - 1);
+                                viewing = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char('p') => {
+                        if files.is_some() {
+                            file_cur = file_cur.saturating_sub(1);
+                            viewing = None;
+                        }
+                    }
+                    KeyCode::Char('o') => {
+                        if let Some(ref f) = files {
+                            viewing = f.get(file_cur).cloned();
+                        }
+                    }
                     _ => {}
                 }
             }
