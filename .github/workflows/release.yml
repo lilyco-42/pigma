@@ -96,7 +96,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czvf ../../../pigma-${{ matrix.target }}.tar.gz pigma
+          tar czvf ../../../pigma-${{ matrix.target }}.tar.gz pigma pigma_trace
           cd -
 
       - name: Package (windows)
@@ -104,7 +104,7 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../pigma-${{ matrix.target }}.zip pigma.exe
+          7z a ../../../pigma-${{ matrix.target }}.zip pigma.exe pigma_trace.exe
           cd ..
 
       - name: Upload build artifact
