@@ -51,6 +51,9 @@ fn fmt_event(v: &serde_json::Value) -> String {
 }
 
 /// 读 trace → 歌词行 (time 用事件自带的 t_ms; 缺省按序号 × 800ms 兜底)
+///
+/// 注意: trace 的 t_ms 是**真实执行耗时**, 一段快任务整条只有几十毫秒 →
+/// 直接按它播会"一闪而过"。所以默认 `--beat` (一步一拍) 覆盖时间轴, `--real` 才用真实时间。
 fn load_lines(path: &PathBuf) -> Vec<LyricLine> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -78,11 +81,22 @@ fn load_lines(path: &PathBuf) -> Vec<LyricLine> {
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("用法: pigma-trace <trace.ndjson> [--follow] [--speed 1.0]");
+        eprintln!(
+            "用法: pigma-trace <trace.ndjson> [--follow] [--speed 1.0] [--beat 1200] [--real]\n\
+             \x20 --beat <ms>  一步一拍 (默认 1200ms, 覆盖事件时间轴 —— 快任务不会一闪而过)\n\
+             \x20 --real       用 trace 里的真实 t_ms (适合本身就跨秒的任务)"
+        );
         std::process::exit(2);
     }
     let path = PathBuf::from(&args[0]);
     let follow = args.iter().any(|a| a == "--follow");
+    let real = args.iter().any(|a| a == "--real");
+    let beat: u64 = args
+        .iter()
+        .position(|a| a == "--beat")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1200);
     let mut speed: f64 = args
         .iter()
         .position(|a| a == "--speed")
@@ -91,6 +105,15 @@ fn main() -> io::Result<()> {
         .unwrap_or(1.0);
 
     let mut lines = load_lines(&path);
+    // 默认"一步一拍": 重写时间轴 (真实 t_ms 常是几十 ms, 按它播会一闪而过)
+    let retime = |ls: &mut Vec<LyricLine>| {
+        if !real {
+            for (i, l) in ls.iter_mut().enumerate() {
+                l.time = Duration::from_millis((i as u64 + 1) * beat);
+            }
+        }
+    };
+    retime(&mut lines);
     if lines.is_empty() {
         eprintln!("[pigma-trace] {} 无有效事件 (还没开始?)", path.display());
     }
@@ -117,6 +140,7 @@ fn main() -> io::Result<()> {
             if let Ok(mt) = std::fs::metadata(&path).and_then(|m| m.modified()) {
                 if Some(mt) != last_mtime {
                     lines = load_lines(&path);
+                    retime(&mut lines); // 直播时新事件同样按拍重排, 不会一闪而过
                     last_mtime = Some(mt);
                 }
             }
