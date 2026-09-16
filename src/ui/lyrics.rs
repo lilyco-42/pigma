@@ -43,7 +43,7 @@ fn find_current_line(lyrics: &[LyricLine], cur_ms: f64) -> usize {
     })
 }
 
-pub(super) fn draw(
+pub fn draw(
     f: &mut Frame,
     player: &PlaybackState,
     bs: &BlockStyle<'_>,
@@ -56,10 +56,7 @@ pub(super) fn draw(
     let inner = block.inner(area);
     f.render_widget(block.block_padding(Padding::vertical(1)), area);
 
-    let Some(song) = &player.current_song else {
-        return;
-    };
-
+    // 无 song 也允许渲染 (trace 回放模式: 只有 lyrics, 靠末行时间当总时长)
     let Some(lyrics) = &player.lyrics else {
         return;
     };
@@ -72,7 +69,14 @@ pub(super) fn draw(
         return;
     }
 
-    let dur_secs = song.duration as f64 / 1000.0;
+    // 音乐路径: 用歌曲时长; trace 回放: 用末行时间 + 3s (行为对音乐场景不变)
+    let dur_secs = match &player.current_song {
+        Some(s) => s.duration as f64 / 1000.0,
+        None => lyrics
+            .last()
+            .map(|l| l.time.as_secs_f64() + 3.0)
+            .unwrap_or(1.0),
+    };
     let cur_ms = player.progress * dur_secs * 1000.0;
     let cur = find_current_line(lyrics, cur_ms);
 

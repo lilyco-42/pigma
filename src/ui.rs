@@ -1,14 +1,14 @@
 //! ratatui widgets and rendering helpers used by the views (tables, player bar,
 //! navigation, lyrics, toasts, spinners, breadcrumbs, ...).
 
-mod block;
+pub mod block;
 mod breadcrumb;
 mod command_panel;
 mod content;
 mod gradient_line_gauge;
 mod help;
 mod login;
-mod lyrics;
+pub mod lyrics;
 mod navigation;
 mod playerbar;
 mod queue;
