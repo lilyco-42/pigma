@@ -218,7 +218,8 @@ fn main() -> io::Result<()> {
              \x20 --beat <ms>  一步一拍 (默认 1200ms, 覆盖事件时间轴 —— 快任务不会一闪而过)\n\
              \x20 --real       用 trace 里的真实 t_ms (适合本身就跨秒的任务)\n\
              键位: 空格 暂停/播放 · j/k 单步 · +/- 调速 · r 真执行当前步(看结果) · R 清空\n\
-             \x20     f 文件面板(yazi-like) · n/p 选文件 · o 预览(带语法着色) · q 退出\n\
+             \x20     f 文件面板(yazi-like) · n/p 选文件 · o 预览(带语法着色)\n\
+             \x20     y 调用真 yazi(--chooser-file) 选文件后预览 · q 退出\n\
              \x20     文件面板根目录可用 LYCO_TRACE_ROOT 指定 (默认当前目录)"
         );
         std::process::exit(2);
@@ -440,6 +441,31 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('o') => {
                         if let Some(ref f) = files {
                             viewing = f.get(file_cur).cloned();
+                        }
+                    }
+                    // y: 直接调真 yazi (官方 --chooser-file), 退出后读回选中文件 → 预览
+                    KeyCode::Char('y') => {
+                        let choose = std::env::temp_dir().join("lyco_yazi_choice");
+                        let _ = std::fs::remove_file(&choose);
+                        // 先把终端交还给 yazi
+                        let _ = disable_raw_mode();
+                        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                        let root = std::env::var("LYCO_TRACE_ROOT")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+                        let _ = std::process::Command::new("yazi")
+                            .args(["--chooser-file", &choose.to_string_lossy()])
+                            .current_dir(&root)
+                            .status();
+                        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+                        let _ = enable_raw_mode();
+                        let _ = terminal.clear();
+                        if let Ok(p) = std::fs::read_to_string(&choose) {
+                            let p = p.trim();
+                            if !p.is_empty() {
+                                viewing = Some(std::path::PathBuf::from(p));
+                                files = None;
+                            }
                         }
                     }
                     _ => {}
